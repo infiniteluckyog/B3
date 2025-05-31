@@ -1,0 +1,5 @@
+Flask
+requests
+pyfiglet
+user_agent
+gunicorn
