@@ -17,6 +17,32 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 r.follow_redirects = True
 app = Flask(__name__)
 
+def safe_get(url, **kwargs):
+    try:
+        response = requests.get(url, timeout=15, verify=False, **kwargs)
+        if response.status_code != 200:
+            return None, f"Remote site returned status {response.status_code}"
+        if "cloudflare" in response.text.lower() or "captcha" in response.text.lower():
+            return None, "Blocked by site protection (Cloudflare/CAPTCHA)"
+        return response, None
+    except requests.exceptions.Timeout:
+        return None, "Remote site timed out"
+    except Exception as e:
+        return None, f"Request failed: {str(e)}"
+
+def safe_post(url, **kwargs):
+    try:
+        response = r.post(url, timeout=15, verify=False, **kwargs)
+        if response.status_code != 200:
+            return None, f"Remote site returned status {response.status_code}"
+        if "cloudflare" in response.text.lower() or "captcha" in response.text.lower():
+            return None, "Blocked by site protection (Cloudflare/CAPTCHA)"
+        return response, None
+    except requests.exceptions.Timeout:
+        return None, "Remote site timed out"
+    except Exception as e:
+        return None, f"Request failed: {str(e)}"
+
 @app.route('/card', methods=['GET'])
 def baba_ji():
     try:
@@ -119,7 +145,9 @@ def baba_ji():
             'user-agent': user,
         }
 
-        response = requests.get('https://www.bebebrands.com/my-account/', headers=headers, verify=False)
+        response, err = safe_get('https://www.bebebrands.com/my-account/', headers=headers)
+        if err:
+            return jsonify({'error': f'Failed initial page: {err}'}), 502
         reg_search = re.search(r'name="woocommerce-register-nonce" value="(.*?)"', response.text)
         if not reg_search:
             return jsonify({'error': 'woocommerce-register-nonce not found'}), 500
@@ -154,11 +182,15 @@ def baba_ji():
             'register': 'Register',
         }
 
-        response = r.post('https://www.bebebrands.com/my-account/', headers=headers, data=data, verify=False)
+        response, err = safe_post('https://www.bebebrands.com/my-account/', headers=headers, data=data)
+        if err:
+            return jsonify({'error': f'Failed registration: {err}'}), 502
 
         # ------ Step 3: Edit Address ------
         headers['referer'] = 'https://www.bebebrands.com/my-account/edit-address/'
-        response = r.get('https://www.bebebrands.com/my-account/edit-address/billing/', cookies=r.cookies, headers=headers, verify=False)
+        response, err = safe_get('https://www.bebebrands.com/my-account/edit-address/billing/', headers=headers)
+        if err:
+            return jsonify({'error': f'Failed address page: {err}'}), 502
         address_search = re.search(r'name="woocommerce-edit-address-nonce" value="(.*?)"', response.text)
         if not address_search:
             return jsonify({'error': 'woocommerce-edit-address-nonce not found'}), 500
@@ -182,17 +214,19 @@ def baba_ji():
             'action': 'edit_address',
         }
 
-        response = r.post(
+        response, err = safe_post(
             'https://www.bebebrands.com/my-account/edit-address/billing/',
-            cookies=r.cookies,
             headers=headers,
-            data=data,
-            verify=False
+            data=data
         )
+        if err:
+            return jsonify({'error': f'Failed to update address: {err}'}), 502
 
         # ------ Step 4: Get Payment Method Nonce ------
         headers['referer'] = 'https://www.bebebrands.com/my-account/payment-methods/'
-        response = r.get('https://www.bebebrands.com/my-account/add-payment-method/', cookies=r.cookies, headers=headers, verify=False)
+        response, err = safe_get('https://www.bebebrands.com/my-account/add-payment-method/', headers=headers)
+        if err:
+            return jsonify({'error': f'Failed payment method page: {err}'}), 502
         add_nonce_search = re.search(r'name="woocommerce-add-payment-method-nonce" value="(.*?)"', response.text)
         client_search = re.search(r'client_token_nonce":"([^"]+)"', response.text)
         if not add_nonce_search or not client_search:
@@ -221,7 +255,9 @@ def baba_ji():
             'action': 'wc_braintree_credit_card_get_client_token',
             'nonce': client,
         }
-        response = r.post('https://www.bebebrands.com/wp-admin/admin-ajax.php', cookies=r.cookies, headers=headers_braintree, data=data, verify=False)
+        response, err = safe_post('https://www.bebebrands.com/wp-admin/admin-ajax.php', headers=headers_braintree, data=data)
+        if err:
+            return jsonify({'error': f'Failed to get Braintree token: {err}'}), 502
         enc = response.json().get('data')
         if not enc:
             return jsonify({'error': 'No Braintree data received'}), 500
@@ -273,8 +309,17 @@ def baba_ji():
             'operationName': 'TokenizeCreditCard',
         }
 
-        response = requests.post('https://payments.braintree-api.com/graphql', headers=headers_api, json=json_data, verify=False)
-        tok = response.json().get('data', {}).get('tokenizeCreditCard', {}).get('token')
+        try:
+            response_api = requests.post('https://payments.braintree-api.com/graphql', headers=headers_api, json=json_data, timeout=15, verify=False)
+        except requests.exceptions.Timeout:
+            return jsonify({'error': 'Braintree API timed out'}), 504
+        except Exception as e:
+            return jsonify({'error': f'Braintree API request failed: {str(e)}'}), 500
+        if response_api.status_code != 200:
+            return jsonify({'error': f'Braintree API returned {response_api.status_code}'}), 502
+        if "cloudflare" in response_api.text.lower() or "captcha" in response_api.text.lower():
+            return jsonify({'error': 'Braintree API Blocked by protection'}), 403
+        tok = response_api.json().get('data', {}).get('tokenizeCreditCard', {}).get('token')
         if not tok:
             return jsonify({'status': 'Extracted Failed'}), 400
 
@@ -301,7 +346,9 @@ def baba_ji():
             ('_wp_http_referer', '/my-account/add-payment-method/'),
             ('woocommerce_add_payment_method', '1'),
         ]
-        response = r.post('https://www.bebebrands.com/my-account/add-payment-method/', cookies=r.cookies, headers=headers, data=data, verify=False)
+        response, err = safe_post('https://www.bebebrands.com/my-account/add-payment-method/', headers=headers, data=data)
+        if err:
+            return jsonify({'error': f'Failed final payment step: {err}'}), 502
         text = response.text
         pattern = r'Status code (.*?)\s*</li>'
         match = re.search(pattern, text)
